@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path"
@@ -230,14 +231,81 @@ func (host *pclLanguageHost) bindProgramFromDirectory(
 	loader := schema.NewCachedLoader(client)
 	defer contract.IgnoreClose(client)
 
+	parser := hclsyntax.NewParser()
+	parseDiagnostics, err := pcl.ParseDirectory(parser, directory)
+	if err != nil {
+		return nil, parseDiagnostics, fmt.Errorf("parse directory: %w", err)
+	}
+	packageBlockDiags := dedupeIdenticalPackageBlocks(parser.Files)
+	parseDiagnostics = append(parseDiagnostics, packageBlockDiags...)
+	if parseDiagnostics.HasErrors() {
+		return nil, parseDiagnostics, nil
+	}
+
 	options := []pcl.BindOption{
+		pcl.Loader(loader),
+		pcl.DirPath(directory),
+		pcl.ComponentBinder(pcl.ComponentProgramBinderFromFileSystem()),
 		pcl.PreferOutputVersionedInvokes,
 	}
 	if !strict {
 		options = append(options, pcl.NonStrictBindOptions()...)
 	}
 
-	return pcl.BindDirectory(directory, loader, options...)
+	program, bindDiagnostics, err := pcl.BindProgram(parser.Files, options...)
+	if bindDiagnostics != nil {
+		err = nil
+	}
+
+	allDiagnostics := append(parseDiagnostics, bindDiagnostics...)
+	return program, allDiagnostics, err
+}
+
+func dedupeIdenticalPackageBlocks(files []*hclsyntax.File) hcl.Diagnostics {
+	var diagnostics hcl.Diagnostics
+	seen := map[string]*schema.PackageDescriptor{}
+	for _, file := range files {
+		filePackageDescriptors, diags := pcl.ReadPackageDescriptors(file)
+		diagnostics = append(diagnostics, diags...)
+
+		blocks := make([]*hashihclsyntax.Block, 0, len(file.Body.Blocks))
+		for _, block := range file.Body.Blocks {
+			if block.Type != "package" || len(block.Labels) != 1 {
+				blocks = append(blocks, block)
+				continue
+			}
+
+			packageName := block.Labels[0]
+			descriptor, ok := filePackageDescriptors[packageName]
+			if !ok {
+				blocks = append(blocks, block)
+				continue
+			}
+
+			existing, hasExisting := seen[packageName]
+			if !hasExisting {
+				seen[packageName] = descriptor
+				blocks = append(blocks, block)
+				continue
+			}
+
+			if packageDescriptorsEqual(existing, descriptor) {
+				continue
+			}
+
+			message := fmt.Sprintf("package %q was already defined", packageName)
+			subjectRange := block.Range()
+			diagnostics = append(diagnostics, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  message,
+				Detail:   message,
+				Subject:  &subjectRange,
+			})
+			blocks = append(blocks, block)
+		}
+		file.Body.Blocks = blocks
+	}
+	return diagnostics
 }
 
 func (host *pclLanguageHost) Run(ctx context.Context, req *pulumirpc.RunRequest) (*pulumirpc.RunResponse, error) {
@@ -266,19 +334,20 @@ func (host *pclLanguageHost) Run(ctx context.Context, req *pulumirpc.RunRequest)
 	}
 
 	interpreter := pclruntime.NewInterpreter(program, pclruntime.RunInfo{
-		Project:        req.GetProject(),
-		Stack:          req.GetStack(),
-		Organization:   req.GetOrganization(),
-		RootDirectory:  req.GetInfo().RootDirectory,
-		ProgramDir:     req.GetInfo().ProgramDirectory,
-		WorkingDir:     req.GetPwd(),
-		Config:         req.GetConfig(),
-		ConfigSecrets:  req.GetConfigSecretKeys(),
-		MonitorAddress: req.GetMonitorAddress(),
-		EngineAddress:  host.engineAddress,
-		LoaderAddress:  req.GetLoaderTarget(),
-		DryRun:         req.GetDryRun(),
-		Parallel:       req.GetParallel(),
+		Project:            req.GetProject(),
+		Stack:              req.GetStack(),
+		Organization:       req.GetOrganization(),
+		RootDirectory:      req.GetInfo().RootDirectory,
+		ProgramDir:         req.GetInfo().ProgramDirectory,
+		WorkingDir:         req.GetPwd(),
+		Config:             req.GetConfig(),
+		ConfigSecrets:      req.GetConfigSecretKeys(),
+		MonitorAddress:     req.GetMonitorAddress(),
+		EngineAddress:      host.engineAddress,
+		LoaderAddress:      req.GetLoaderTarget(),
+		DryRun:             req.GetDryRun(),
+		Parallel:           req.GetParallel(),
+		PackageDescriptors: allPackageDescriptors(req.Info.ProgramDirectory),
 	})
 
 	if err := interpreter.Run(ctx); err != nil {
@@ -381,8 +450,65 @@ func (host *pclLanguageHost) GetRequiredPlugins(
 	return nil, status.Errorf(codes.Unimplemented, "method GetRequiredPlugins not implemented")
 }
 
+func packageDescriptorsEqual(a, b *schema.PackageDescriptor) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Name != b.Name || a.DownloadURL != b.DownloadURL {
+		return false
+	}
+	if (a.Version == nil) != (b.Version == nil) {
+		return false
+	}
+	if a.Version != nil && !a.Version.Equals(*b.Version) {
+		return false
+	}
+	if (a.Parameterization == nil) != (b.Parameterization == nil) {
+		return false
+	}
+	if a.Parameterization != nil {
+		ap := a.Parameterization
+		bp := b.Parameterization
+		if ap.Name != bp.Name || !ap.Version.Equals(bp.Version) {
+			return false
+		}
+		if !bytes.Equal(ap.Value, bp.Value) {
+			return false
+		}
+	}
+	return true
+}
+
+func getPclPackageDescriptors(parser *hclsyntax.Parser) (map[string]*schema.PackageDescriptor, hcl.Diagnostics) {
+	descriptorMap := map[string]*schema.PackageDescriptor{}
+	var diagnostics hcl.Diagnostics
+	for _, file := range parser.Files {
+		filePackageDescriptors, diags := pcl.ReadPackageDescriptors(file)
+		diagnostics = append(diagnostics, diags...)
+		for packageName, descriptor := range filePackageDescriptors {
+			existing, ok := descriptorMap[packageName]
+			if !ok {
+				descriptorMap[packageName] = descriptor
+				continue
+			}
+			if packageDescriptorsEqual(existing, descriptor) {
+				continue
+			}
+			message := fmt.Sprintf("package %q was already defined", packageName)
+			subjectRange := file.Body.Range()
+			diagnostics = append(diagnostics, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  message,
+				Detail:   message,
+				Subject:  &subjectRange,
+			})
+		}
+	}
+	return descriptorMap, diagnostics
+}
+
 func getPclDependencies(parser *hclsyntax.Parser) ([]*schema.PackageDescriptor, error) {
-	descriptorMap, diags := pcl.ReadAllPackageDescriptors(parser.Files)
+	descriptorMap, diags := getPclPackageDescriptors(parser)
 	if diags.HasErrors() {
 		return nil, diags
 	}
@@ -436,8 +562,7 @@ func getPclDependencies(parser *hclsyntax.Parser) ([]*schema.PackageDescriptor, 
 }
 
 func readPclDependencies(programDir string) ([]*schema.PackageDescriptor, error) {
-	parser := hclsyntax.NewParser()
-	parseDiagnostics, err := pcl.ParseDirectory(parser, programDir)
+	parser, parseDiagnostics, err := parsePclTree(programDir)
 	if err != nil {
 		return nil, err
 	}
@@ -446,6 +571,54 @@ func readPclDependencies(programDir string) ([]*schema.PackageDescriptor, error)
 	}
 
 	return getPclDependencies(parser)
+}
+
+func parsePclTree(programDir string) (*hclsyntax.Parser, hcl.Diagnostics, error) {
+	parser := hclsyntax.NewParser()
+	var parseDiagnostics hcl.Diagnostics
+	err := filepath.WalkDir(programDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if filepath.Ext(d.Name()) != ".pp" {
+			return nil
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer contract.IgnoreClose(file)
+
+		relPath, err := filepath.Rel(programDir, path)
+		if err != nil {
+			return err
+		}
+
+		if err := parser.ParseFile(file, relPath); err != nil {
+			return err
+		}
+		parseDiagnostics = append(parseDiagnostics, parser.Diagnostics...)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return parser, parseDiagnostics, nil
+}
+
+func allPackageDescriptors(programDir string) map[string]*schema.PackageDescriptor {
+	parser, parseDiagnostics, err := parsePclTree(programDir)
+	if err != nil || parseDiagnostics.HasErrors() {
+		return nil
+	}
+	descriptorMap, diags := getPclPackageDescriptors(parser)
+	if diags.HasErrors() {
+		return nil
+	}
+	return descriptorMap
 }
 
 func invokeToken(call *hashihclsyntax.FunctionCallExpr) (string, bool) {
@@ -487,23 +660,7 @@ func (host *pclLanguageHost) RunPlugin(
 func (host *pclLanguageHost) GenerateProject(
 	ctx context.Context, req *pulumirpc.GenerateProjectRequest,
 ) (*pulumirpc.GenerateProjectResponse, error) {
-	loader, err := schema.NewLoaderClient(req.LoaderTarget)
-	if err != nil {
-		return nil, err
-	}
-	defer loader.Close()
-
-	bindOptions := []pcl.BindOption{
-		pcl.PreferOutputVersionedInvokes,
-	}
-	if !req.Strict {
-		bindOptions = append(bindOptions, pcl.NonStrictBindOptions()...)
-	}
-	program, diags, err := pcl.BindDirectory(
-		req.SourceDirectory,
-		schema.NewCachedLoader(loader),
-		bindOptions...,
-	)
+	program, diags, err := host.bindProgramFromDirectory(req.SourceDirectory, req.LoaderTarget, req.Strict)
 	if err != nil {
 		return nil, err
 	}
